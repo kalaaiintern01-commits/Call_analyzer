@@ -1,0 +1,17 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9
+python-dotenv==1.0.1
+requests==2.32.3
+pydantic==2.10.6
+plivo>=4.60.0
+imageio-ffmpeg>=0.5.1
+pyodbc>=5.0  # SQL Server connection for ERP enquiries
+
+# Pipecat conversational AI agent (Phase 1)
+pipecat-ai[webrtc,sarvam,openai,anthropic,deepgram,silero]>=1.1.0
+pipecat-ai-small-webrtc-prebuilt>=2.5.0
+anthropic>=0.45.0    # direct Anthropic SDK — preferred over OpenRouter for LLM
+# deepgram-sdk is pulled in by pipecat-ai[deepgram] above — don't pin it
+# separately, that conflicts with the version range pipecat itself tests against.
+loguru>=0.7

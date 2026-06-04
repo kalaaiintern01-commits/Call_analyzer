@@ -1,0 +1,49 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local agent state
+.claude/
+
+# Product catalogs (large PDFs — keep local only)
+catalogs/
+
+# Throwaway TTS pronunciation-tuning scratch (local only)
+_tts_*.py
+_gen_devanagari.py
+_devanagari_map.txt
+tts_test/
+err.log

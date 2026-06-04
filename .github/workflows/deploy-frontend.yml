@@ -1,0 +1,155 @@
+# Deploy Frontend Remote — KALA Call Center (Module Federation remote)
+#
+# This frontend is a Module Federation remote consumed by the KALA shell. The
+# shell pins this URL via VITE_CALL_CENTER_URL:
+#
+#   https://ai.kalapms.com/cdn/call-center/latest/assets/remoteEntry.js
+#
+# Deploy layout under SITE_ROOT:
+#   D:\inetpub\cdn\call-center\
+#     latest\       ← the build the shell fetches; overwritten each deploy
+#       assets\
+#         remoteEntry.js
+#       index.html
+#       ...
+#     v<sha>\       ← snapshot of the PREVIOUS latest, taken just before this
+#                     deploy overwrote it. Rollback fodder only — these are
+#                     NOT independently servable because their internal chunk
+#                     references point at /cdn/call-center/latest/. To roll
+#                     back: robocopy a v<sha>\ back into latest\.
+#
+# vite.config.js sets `base: '/cdn/call-center/latest/'` in production mode so
+# the built index.html + remoteEntry.js reference assets under that exact URL
+# prefix. The two must stay in sync; changing one without the other breaks
+# every chunk fetch with a 404.
+#
+# ONE-TIME SERVER PREREQ (not in this workflow):
+#   - IIS site at SITE_ROOT must include CORS headers IF the shell origin
+#     differs from ai.kalapms.com. Same-origin loads (shell + CDN both on
+#     ai.kalapms.com) need no CORS. See federation-cookbook §8 if cross-origin.
+#   - The shell's .env must set VITE_CALL_CENTER_URL to the URL above.
+#     Platform Architecture owns that change.
+#   - The 'call-center' AppId must be added to docs/auth-contract.md §3 before
+#     SSO works end-to-end. Until then the URL-param reader in App.jsx is a no-op.
+#
+# ASSUMPTIONS — confirm before first run:
+#  - Self-hosted Windows runner labelled [self-hosted, Windows, kala-prod].
+#  - SITE_ROOT below is the IIS physical path that serves this app's static
+#    files (check `Get-Website | Select PhysicalPath` for the site that maps
+#    URL /cdn/call-center/ to this folder).
+#  - The frontend talks to the backend via /api — IIS must reverse-proxy
+#    /api to port 8006 (URL Rewrite + ARR), or set an absolute API base
+#    at build time.
+#
+# If the server is NOT the KALA Windows box, retarget this for that host.
+
+name: Deploy Frontend Remote (Call Center)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch:
+
+env:
+  SITE_ROOT:  'D:\inetpub\cdn\call-center'            # parent folder for latest/ + v<sha>/
+  LATEST_DIR: 'D:\inetpub\cdn\call-center\latest'     # what the shell fetches from
+  KEEP_VERSIONS: '5'
+
+concurrency:
+  group: frontend-call-center
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Windows, kala-prod]
+    defaults:
+      run:
+        working-directory: frontend
+        shell: powershell
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Federation contract: react / react-dom / react-router-dom must be
+      # byte-identical to the shell. Mismatch causes "invalid hook call" at
+      # runtime when the remote mounts. See version-standardization.md §3.1.
+      - name: Verify Tier-1 versions
+        run: |
+          node -e "const want={'react':'18.2.0','react-dom':'18.2.0','react-router-dom':'6.22.0'};for(const[p,v] of Object.entries(want)){const got=require(p+'/package.json').version;if(got!==v){console.error('FAIL '+p+': '+got+' != '+v);process.exit(1);}console.log('OK '+p+' '+got);}"
+
+      - name: Build
+        run: |
+          npm run build
+          if (-not (Test-Path "dist\index.html")) {
+            Write-Error "Build did not produce dist\index.html"
+            exit 1
+          }
+          if (-not (Test-Path "dist\assets\remoteEntry.js")) {
+            Write-Error "Build did not produce dist\assets\remoteEntry.js - federation plugin misconfigured?"
+            exit 1
+          }
+          Write-Host "OK built dist/ (including remoteEntry.js)"
+
+      # Snapshot the CURRENT contents of latest/ into a sibling v<sha>/ BEFORE
+      # we overwrite latest/. This way `latest/` is always the active build and
+      # `v<sha>/` folders are immutable post-deploy rollback points.
+      - name: Snapshot current latest/ for rollback
+        run: |
+          $sha       = "${{ github.sha }}".Substring(0, 7)
+          $snapshot  = "${{ env.SITE_ROOT }}\v$sha"
+          if (Test-Path "${{ env.LATEST_DIR }}\index.html") {
+            New-Item -ItemType Directory -Force -Path "${{ env.SITE_ROOT }}" | Out-Null
+            robocopy "${{ env.LATEST_DIR }}" $snapshot /MIR /XD .git /R:3 /W:5
+            if ($LASTEXITCODE -gt 7) { Write-Error "snapshot failed"; exit 1 }
+            $LASTEXITCODE = 0
+            Write-Host "OK snapshotted previous latest -> v$sha"
+          } else {
+            Write-Host "(first deploy - nothing to snapshot)"
+          }
+
+      - name: Deploy dist to latest/
+        run: |
+          New-Item -ItemType Directory -Force -Path "${{ env.LATEST_DIR }}" | Out-Null
+          robocopy dist "${{ env.LATEST_DIR }}" /MIR /XD .git /R:3 /W:5
+          if ($LASTEXITCODE -gt 7) { Write-Error "deploy robocopy failed"; exit 1 }
+          $LASTEXITCODE = 0
+          Write-Host "OK deployed to ${{ env.LATEST_DIR }}"
+
+      # The shell only ever fetches remoteEntry.js — if it's missing, nothing else
+      # matters. Cheap post-deploy sanity check before pruning rollback snapshots.
+      - name: Verify remoteEntry.js is in place
+        run: |
+          $manifest = "${{ env.LATEST_DIR }}\assets\remoteEntry.js"
+          if (-not (Test-Path $manifest)) {
+            Write-Error "remoteEntry.js missing at $manifest after deploy"
+            exit 1
+          }
+          Write-Host "OK remoteEntry.js present at $manifest"
+
+      # Prune old snapshots living as siblings of latest/. Filter "v*" is
+      # specific enough to never touch latest\ (literal name) but match every
+      # v<sha>\ folder. KEEP_VERSIONS most-recent are retained.
+      - name: Prune old snapshots (keep last N)
+        if: always()
+        run: |
+          if (Test-Path "${{ env.SITE_ROOT }}") {
+            Get-ChildItem "${{ env.SITE_ROOT }}" -Directory -Filter "v*" |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -Skip ${{ env.KEEP_VERSIONS }} |
+              ForEach-Object {
+                Write-Host "Pruning old snapshot: $($_.Name)"
+                Remove-Item $_.FullName -Recurse -Force
+              }
+          }

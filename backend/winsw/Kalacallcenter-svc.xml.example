@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW service config — Call Center backend (FastAPI voice agent).
+
+  Deviation from the platform-standard PyInstaller deploy model: this app runs
+  FROM SOURCE via a venv on the server, because pipecat + torch + silero +
+  onnxruntime do not bundle reliably with PyInstaller. The deploy workflow
+  (.github/workflows/deploy-backend.yml) keeps the venv and the synced source
+  up to date; this XML itself never changes between deploys.
+
+  On-server layout (%BASE% = the folder this XML lives in):
+    %BASE%\
+      .venv\Scripts\python.exe         interpreter the workflow refreshes
+      app\                             repo's backend/ synced here by CI
+        main.py                        FastAPI entrypoint, port 8006
+        .env                           secrets; CI never overwrites
+      logs\                            WinSW writes daily-rolling stdout/stderr
+      Kalacallcenter-svc.exe           renamed WinSW binary
+      Kalacallcenter-svc.xml           copy of this file (rename, drop the .example)
+
+  One-time install (admin PowerShell). Write this XML as UTF-8 WITHOUT a BOM
+  (see docs/first_deploy.md §2.3 for the encoding pitfall), then:
+      & "$root\Kalacallcenter-svc.exe" install
+      & "$root\Kalacallcenter-svc.exe" start
+  After that the deploy-backend.yml workflow Stop-Service / Start-Service's
+  this service by <id> on every push to main.
+-->
+<service>
+  <id>KalaCallCenterBackend</id>
+  <name>KALA Call Center Backend</name>
+  <description>Call Center voice agent (FastAPI, port 8006).</description>
+
+  <executable>%BASE%\.venv\Scripts\python.exe</executable>
+  <arguments>main.py</arguments>
+
+  <!-- main.py loads .env via Path(__file__).parent/".env", so the working
+       directory MUST be the synced-source folder, not %BASE%. -->
+  <workingdirectory>%BASE%\app</workingdirectory>
+
+  <!-- Production-mode toggles in main.py: the standard error envelope
+       (backend-standardizations §5.2) and any future JWT enforcement only
+       activate when APP_ENV=production. Setting it here means the WinSW-
+       managed deploy is always production-mode; standalone `python main.py`
+       on a dev laptop stays dev-mode unless the developer opts in via .env. -->
+  <env name="APP_ENV" value="production" />
+  <env name="SERVICE_NAME" value="call-center" />
+
+  <onfailure action="restart" delay="5 sec" />
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <log mode="roll-by-time">
+    <pattern>yyyyMMdd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+    <zipOlderThanNumDays>14</zipOlderThanNumDays>
+  </log>
+  <logpath>%BASE%\logs</logpath>
+
+  <stoptimeout>30 sec</stoptimeout>
+  <startmode>Automatic</startmode>
+</service>

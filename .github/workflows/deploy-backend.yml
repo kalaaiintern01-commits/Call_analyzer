@@ -1,0 +1,114 @@
+# Deploy Backend Service — Genset Call Analyzer (FastAPI voice agent)
+#
+# ADAPTED from docs/github-actions-integration.md Template B. Two deliberate
+# deviations for THIS app (do not "fix" them back to the template):
+#
+#  1. NO PyInstaller. The template builds a --onefile exe. This backend pulls in
+#     pipecat + torch + silero + onnxruntime, which carry native binaries and
+#     model data files that PyInstaller does not bundle reliably. Instead we
+#     deploy FROM SOURCE: the self-hosted runner updates a venv on the server
+#     and restarts the WinSW service, which runs `python main.py` from that venv.
+#  2. Health check hits port 8006 (this app's canonical backend port; see
+#     docs/backend-standardizations.md section 8).
+#
+# ASSUMPTIONS — confirm before first run:
+#  - A self-hosted Windows runner labelled [self-hosted, Windows, kala-prod]
+#    exists AND runs on the same server that hosts the service (deploy-in-place).
+#  - The WinSW service named below already exists and its XML runs:
+#       <executable>D:\deployments\genset\backend\.venv\Scripts\python.exe</executable>
+#       <arguments>main.py</arguments>   (working dir = repo's backend/ on the server)
+#    See docs/first_deploy.md + deployment-runbook.md for the one-time service setup.
+#  - .env lives in the deploy path and is NEVER overwritten by this workflow.
+#
+# If the server is NOT the KALA Windows box (e.g. a Linux VM with systemd),
+# this file needs rewriting for that target — tell the maintainer.
+
+name: Deploy Backend (Genset Call Analyzer)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:
+
+env:
+  SERVICE_NAME: KalaCallCenterBackend                   # must match WinSW <id> on the server
+  DEPLOY_PATH:  'D:\deployments\call-center\backend'        # holds repo checkout, .venv, .env, WinSW
+  HEALTH_URL:   'http://localhost:8006/api/health'
+  KEEP_VERSIONS: '5'
+
+concurrency:
+  group: backend-genset
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Windows, kala-prod]
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      # Sync the repo's backend/ into the deploy path WITHOUT touching .env,
+      # .venv, logs, or rollback snapshots. robocopy 0-7 are success codes.
+      - name: Sync source to deploy path (preserve .env / .venv / logs)
+        run: |
+          $src = "backend"
+          $dst = "${{ env.DEPLOY_PATH }}\app"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          robocopy $src $dst /MIR /XD .venv __pycache__ logs versions .git /XF .env /R:3 /W:5
+          if ($LASTEXITCODE -gt 7) { Write-Error "robocopy source sync failed"; exit 1 }
+          $LASTEXITCODE = 0
+          Write-Host "OK source synced to $dst"
+
+      # Build/refresh the venv from source on the server. py -3.11 selects the
+      # interpreter explicitly (see docs note on actions/setup-python flakiness).
+      - name: Update virtualenv
+        working-directory: ${{ env.DEPLOY_PATH }}
+        run: |
+          if (-not (Test-Path ".venv")) {
+            py -3.11 -m venv .venv
+            Write-Host "OK created .venv"
+          }
+          # Use `python -m pip` so pip can upgrade itself on Windows (pip.exe
+          # is locked while running and refuses self-upgrade via the wrapper).
+          .\.venv\Scripts\python.exe -m pip install -q --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -q -r app\requirements.txt
+          Write-Host "OK dependencies installed"
+
+      - name: Restart service
+        run: |
+          $svc = "${{ env.SERVICE_NAME }}"
+          if ((Get-Service $svc -ErrorAction SilentlyContinue).Status -eq "Running") {
+            Stop-Service $svc
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Service $svc).Status -ne "Stopped" -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+            }
+            Write-Host "OK service stopped"
+          }
+          Start-Service $svc
+          Start-Sleep -Seconds 8
+          $status = (Get-Service $svc).Status
+          if ($status -ne "Running") {
+            Write-Error "Service did not return to Running - status: $status"
+            exit 1
+          }
+          Write-Host "OK $svc is $status"
+
+      - name: Health check
+        run: |
+          $deadline = (Get-Date).AddSeconds(40)
+          do {
+            try {
+              $r = Invoke-WebRequest -Uri "${{ env.HEALTH_URL }}" -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -eq 200) { Write-Host "OK health 200"; exit 0 }
+            } catch { Start-Sleep -Seconds 2 }
+          } while ((Get-Date) -lt $deadline)
+          Write-Error "Health check did not return 200 within 40s"
+          exit 1
